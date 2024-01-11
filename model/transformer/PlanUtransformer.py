@@ -37,7 +37,7 @@ class PlanUAutoRegTransformer(BaseModule):
         num_tokens,
         num_frames,
         num_layers,
-        img_shape,
+        occ_shape,
         pose_shape,
         tpe_dim=10,
         output_channel=1024,
@@ -51,6 +51,7 @@ class PlanUAutoRegTransformer(BaseModule):
         tokens_untouched=False,
         add_aggregate=False,
         learnable_queries=True,
+        img_vae_exist=False,
         without_multiscale=False,
         without_spatial_attn=False,
         without_pose_spatial_attn=False,
@@ -65,7 +66,7 @@ class PlanUAutoRegTransformer(BaseModule):
         self.channels = channels
         self.learnable_queries = learnable_queries
         if self.learnable_queries:
-            self.queries = nn.Embedding(img_shape[1]*img_shape[2], img_shape[0])
+            self.queries = nn.Embedding(occ_shape[1] * occ_shape[2], occ_shape[0])
         self.offset = 1 if conditional else 0
         self.temporal_embeddings = nn.Embedding(num_frames + self.offset, tpe_dim)
         if self.learnable_queries:
@@ -73,6 +74,15 @@ class PlanUAutoRegTransformer(BaseModule):
         self.pose_temporal_embeddings = nn.Embedding(num_frames + self.offset, tpe_dim)
         self.pose_attn_layers = pose_attn_layers if pose_attn_layers is not None else temporal_attn_layers
         
+        self.img_vae_exist = img_vae_exist
+        # if img_vae_exist:
+        #     if self.learnable_queries:
+        #         assert img_shape is not None
+        #         self.img_queries = nn.Embedding(img_shape[1]*img_shape[2], img_shape[0])
+        #     self.img_conv = nn.Conv3d(img_shape[0], tpe_dim, kernel_size=(1, 1, 1))
+        #     self.img_temporal_embeddings = nn.Embedding(num_frames + self.offset, tpe_dim)
+        #     self.img_deconv = nn.Conv3d(tpe_dim, img_shape[0], kernel_size=(1, 1, 1))
+
         self.temporal_attentions_en = nn.ModuleList([])
         self.temporal_attentions_de = nn.ModuleList([])
         self.encoders = nn.ModuleList()
@@ -93,7 +103,7 @@ class PlanUAutoRegTransformer(BaseModule):
         self.up_down_sample_params = up_down_sample_params
         self.unfold_params = dict(kernel_size=[1, 2], stride=[1, 2], padding=[0, 0])
         
-        C, H, W = img_shape
+        C, H, W = occ_shape
         layers = len(channels)
         Hs = [H]
         Ws = [W]
@@ -289,13 +299,23 @@ class PlanUAutoRegTransformer(BaseModule):
                 attn_mask[start1: (start1 + num_tokens), start2:] = True
             self.register_buffer('attn_mask', attn_mask, False)
     
-    def forward(self, tokens, pose_tokens):
+    def forward(self, tokens, pose_tokens, img_tokens=None):
+        if self.img_vae_exist:
+            assert img_tokens is not None, 'img_tokens in PlanUtransformer is None'
+            return self.occ_with_img_forward(tokens, pose_tokens, img_tokens)
+        else:
+            return self.occ_forward(tokens, pose_tokens)
+
+
+    def occ_forward(self, tokens, pose_tokens):
         #import pdb;pdb.set_trace()
         # tokens: bs, f, c, h, w
         # pose_tokens, bs, f, c
+        # print(tokens.shape, pose_tokens.shape, img_tokens.shape)
         bs, F, C, H, W = tokens.shape
         assert F == self.num_frames
         tokens = rearrange(tokens, 'b f c h w -> b f h w c')
+
         if self.learnable_queries:
             queries = self.queries.weight.reshape(1, 1, H, W, C).expand(bs, F, H, W, C)
         else:
@@ -361,11 +381,367 @@ class PlanUAutoRegTransformer(BaseModule):
             tokens = down(tokens)
             queries = rearrange(queries, '(b f) c h w -> b f h w c', b=b, f=f)
             tokens = rearrange(tokens, '(b f) c h w -> b f h w c', b=b, f=f) 
+
+        # mid blocks    
         b, f, h, w, c = queries.shape
         queries = rearrange(queries, 'b f h w c -> (b f) c h w')
         tokens = rearrange(tokens, 'b f h w c -> (b f) c h w')
         queries = self.mid(queries)
         tokens = self.mid(tokens)
+        
+        pose_queries = self.pose_mid(pose_queries)
+        pose_tokens = self.pose_mid(pose_tokens)
+        
+        # queries = rearrange(queries, '(b f) c h w -> b f h w c', b=b, f=f)
+        # tokens = rearrange(tokens, '(b f) c h w -> b f h w c', b=b, f=f)
+        for temporal_attn, decoder, up, encoder_out_queries, encoder_out_tokens, pose_attn_de, pose_de_, encoder_out_pose_queries, encoder_out_pose_tokens, pose_up in zip(self.temporal_attentions_de,
+                                                                        self.decoders, self.upsamples, encoder_outs_queries[::-1],
+                                                                        encoder_outs_tokens[::-1], self.pose_attn_de, self.pose_de,
+                                                                        encoder_outs_pose_queries[::-1], encoder_outs_pose_tokens[::-1], self.pose_up):
+            queries = up(queries)
+            tokens = up(tokens)
+            
+            pad_x_queries = encoder_out_queries.shape[2] - queries.shape[2]
+            pad_y_queries = encoder_out_queries.shape[3] - queries.shape[3]
+            queries = nn.functional.pad(queries, (pad_x_queries//2, pad_x_queries-pad_x_queries//2,
+                                      pad_y_queries//2, pad_y_queries-pad_y_queries//2))
+            pad_x_tokens = encoder_out_tokens.shape[2] - tokens.shape[2]
+            pad_y_tokens = encoder_out_tokens.shape[3] - tokens.shape[3]
+            tokens = nn.functional.pad(tokens, (pad_x_tokens//2, pad_x_tokens-pad_x_tokens//2,
+                                      pad_y_tokens//2, pad_y_tokens-pad_y_tokens//2))
+            queries = torch.cat([queries, encoder_out_queries], dim=1)
+            tokens = torch.cat([tokens, encoder_out_tokens], dim=1)
+            c, h, w = queries.shape[-3:]
+            queries = rearrange(queries, '(b f) c h w -> (b h w) f c', b=b, f=f)
+            tokens = rearrange(tokens, '(b f) c h w -> (b h w) f c', b=b, f=f)
+            for cross_attn, cross_norm, ffn, ffn_norm in temporal_attn:
+                queries = queries + cross_attn(queries, tokens, tokens, need_weights=False, attn_mask=self.attn_mask)[0]
+                queries = cross_norm(queries)
+                
+                queries = queries + ffn(queries)
+                queries = ffn_norm(queries)
+            queries = rearrange(queries, '(b h w) f c -> (b f) c h w', b=b, h=h, w=w)
+            tokens = rearrange(tokens, '(b h w) f c -> (b f) c h w', b=b, h=h, w=w)
+            
+            
+            pose_queries = pose_up(pose_queries)
+            pose_tokens = pose_up(pose_tokens)
+            pose_queries = torch.cat([pose_queries, encoder_out_pose_queries], dim=2)
+            pose_tokens = torch.cat([pose_tokens, encoder_out_pose_tokens], dim=2)
+            
+            for pose_temporal_attn, pose_temporal_norm, spatial_attn, spatial_norm, ffn, ffn_norm in pose_attn_de:
+                pose_queries = pose_queries + pose_temporal_attn(pose_queries, pose_tokens, pose_tokens, need_weights=False, attn_mask=self.attn_mask)[0]
+                pose_queries = pose_temporal_norm(pose_queries)
+                #b, f, h, w, c = queries.shape
+                pose_queries = rearrange(pose_queries, 'b f c -> (b f) 1 c')
+                #queries = rearrange(queries, 'b f h w c -> (b f) (h w) c')
+                queries = rearrange(queries, '(b f) c h w -> (b f) (h w) c', b=b, f=f, h=h, w=w)
+                pose_queries = pose_queries + spatial_attn(pose_queries, queries, queries, need_weights=False, attn_mask=None)[0]
+                pose_queries = spatial_norm(pose_queries)
+                
+                pose_queries = pose_queries + ffn(pose_queries)
+                pose_queries = ffn_norm(pose_queries)
+                queries = rearrange(queries, '(b f) (h w) c -> (b f) c h w', b=b, f=f, h=h, w=w)
+                pose_queries = rearrange(pose_queries, '(b f) 1 c -> b f c', b=b, f=f)
+            pose_queries = pose_de_(pose_queries)
+            pose_tokens = pose_de_(pose_tokens)
+            queries = decoder(queries)
+            tokens = decoder(tokens)
+        
+        # print(queries.shape, pose_queries.shape)
+        queries = self.conv_out(queries)
+        pose_queries = self.pose_out(pose_queries)
+        queries = rearrange(queries, '(b f) c h w -> b f c h w', b=b, f=f)
+        # print(queries.shape, pose_queries.shape)
+        return queries, pose_queries
+    
+    def occ_with_img_forward(self, tokens, pose_tokens, img_tokens):
+        #import pdb;pdb.set_trace()
+        # tokens: bs, f, c, h, w
+        # pose_tokens, bs, f, c
+        # print(tokens.shape, pose_tokens.shape, img_tokens.shape)
+
+        # naive concat occupancy tokens with image tokens in channel wise
+        token_channel = tokens.shape[2]
+        tokens = torch.cat((tokens, img_tokens), dim=2)
+
+        bs, F, C, H, W = tokens.shape
+        assert F == self.num_frames
+        tokens = rearrange(tokens, 'b f c h w -> b f h w c')
+
+        if self.learnable_queries:
+            queries = self.queries.weight.reshape(1, 1, H, W, C).expand(bs, F, H, W, C)
+        else:
+            queries = tokens
+        queries = queries + self.temporal_embeddings.weight[None, self.offset:, None, None, :].expand(
+            bs, -1, H, W, -1)
+        tokens = tokens + self.temporal_embeddings.weight[None, :self.num_frames, None, None, :].expand(
+            bs, -1, H, W, -1)
+        
+        if self.learnable_queries:
+            pose_queries = self.pose_queries.weight.reshape(1, 1, C).expand(bs, F, C)
+        else:
+            pose_queries = pose_tokens
+        pose_queries = pose_queries + self.pose_temporal_embeddings.weight[None, self.offset:, :].expand(
+            bs, -1, -1)
+        pose_tokens = pose_tokens + self.pose_temporal_embeddings.weight[None, :self.num_frames, :].expand(
+            bs, -1, -1)
+        
+        encoder_outs_tokens = []
+        encoder_outs_queries = []
+        encoder_outs_pose_tokens = []
+        encoder_outs_pose_queries = []
+        
+        for temporal_attn, encoder, down, pose_attn_en, pose_en in zip(self.temporal_attentions_en, self.encoders, self.downsamples, self.pose_attn_en, self.pose_en):
+            b, f, h, w, c = tokens.shape
+            
+            for pose_temporal_attn, pose_temporal_norm, spatial_attn, spatial_norm, ffn, ffn_norm in pose_attn_en:
+                pose_queries = pose_queries + pose_temporal_attn(pose_queries, pose_tokens, pose_tokens, need_weights=False, attn_mask=self.attn_mask)[0]
+                pose_queries = pose_temporal_norm(pose_queries)
+                #b, f, h, w, c = queries.shape
+                pose_queries = rearrange(pose_queries, 'b f c -> (b f) 1 c')
+                queries = rearrange(queries, 'b f h w c -> (b f) (h w) c')
+                pose_queries = pose_queries + spatial_attn(pose_queries, queries, queries, need_weights=False, attn_mask=None)[0]
+                pose_queries = spatial_norm(pose_queries)
+                
+                pose_queries = pose_queries + ffn(pose_queries)
+                pose_queries = ffn_norm(pose_queries)
+                pose_queries = rearrange(pose_queries, '(b f) 1 c -> b f c', b=b, f=f)
+                queries = rearrange(queries, '(b f) (h w) c -> b f h w c', b=b, f=f, h=h, w=w)
+                
+            pose_queries = pose_en(pose_queries)
+            pose_tokens = pose_en(pose_tokens)
+            encoder_outs_pose_queries.append(pose_queries)
+            encoder_outs_pose_tokens.append(pose_tokens)
+            
+            queries = rearrange(queries, 'b f h w c -> (b h w) f c')
+            tokens = rearrange(tokens, 'b f h w c -> (b h w) f c')
+            #queries = rearrange(queries, 'b f h w c -> (b h w) f c')
+            for cross_attn, cross_norm, ffn, ffn_norm in temporal_attn:
+                queries = queries + cross_attn(queries, tokens, tokens, need_weights=False, attn_mask=self.attn_mask)[0]
+                queries = cross_norm(queries)
+                
+                queries = queries + ffn(queries)
+                queries = ffn_norm(queries)
+            
+            queries = rearrange(queries, '(b h w) f c -> (b f) c h w', b=b, h=h, w=w)
+            tokens = rearrange(tokens, '(b h w) f c -> (b f) c h w', b=b, h=h, w=w)
+            queries = encoder(queries)
+            tokens = encoder(tokens)
+            encoder_outs_tokens.append(tokens)
+            encoder_outs_queries.append(queries)
+            queries = down(queries)
+            tokens = down(tokens)
+            queries = rearrange(queries, '(b f) c h w -> b f h w c', b=b, f=f)
+            tokens = rearrange(tokens, '(b f) c h w -> b f h w c', b=b, f=f) 
+
+        # mid blocks    
+        b, f, h, w, c = queries.shape
+        queries = rearrange(queries, 'b f h w c -> (b f) c h w')
+        tokens = rearrange(tokens, 'b f h w c -> (b f) c h w')
+        queries = self.mid(queries)
+        tokens = self.mid(tokens)
+        
+        pose_queries = self.pose_mid(pose_queries)
+        pose_tokens = self.pose_mid(pose_tokens)
+        
+        # queries = rearrange(queries, '(b f) c h w -> b f h w c', b=b, f=f)
+        # tokens = rearrange(tokens, '(b f) c h w -> b f h w c', b=b, f=f)
+        for temporal_attn, decoder, up, encoder_out_queries, encoder_out_tokens, pose_attn_de, pose_de_, encoder_out_pose_queries, encoder_out_pose_tokens, pose_up in zip(self.temporal_attentions_de,
+                                                                        self.decoders, self.upsamples, encoder_outs_queries[::-1],
+                                                                        encoder_outs_tokens[::-1], self.pose_attn_de, self.pose_de,
+                                                                        encoder_outs_pose_queries[::-1], encoder_outs_pose_tokens[::-1], self.pose_up):
+            queries = up(queries)
+            tokens = up(tokens)
+            
+            pad_x_queries = encoder_out_queries.shape[2] - queries.shape[2]
+            pad_y_queries = encoder_out_queries.shape[3] - queries.shape[3]
+            queries = nn.functional.pad(queries, (pad_x_queries//2, pad_x_queries-pad_x_queries//2,
+                                      pad_y_queries//2, pad_y_queries-pad_y_queries//2))
+            pad_x_tokens = encoder_out_tokens.shape[2] - tokens.shape[2]
+            pad_y_tokens = encoder_out_tokens.shape[3] - tokens.shape[3]
+            tokens = nn.functional.pad(tokens, (pad_x_tokens//2, pad_x_tokens-pad_x_tokens//2,
+                                      pad_y_tokens//2, pad_y_tokens-pad_y_tokens//2))
+            queries = torch.cat([queries, encoder_out_queries], dim=1)
+            tokens = torch.cat([tokens, encoder_out_tokens], dim=1)
+            c, h, w = queries.shape[-3:]
+            queries = rearrange(queries, '(b f) c h w -> (b h w) f c', b=b, f=f)
+            tokens = rearrange(tokens, '(b f) c h w -> (b h w) f c', b=b, f=f)
+            for cross_attn, cross_norm, ffn, ffn_norm in temporal_attn:
+                queries = queries + cross_attn(queries, tokens, tokens, need_weights=False, attn_mask=self.attn_mask)[0]
+                queries = cross_norm(queries)
+                
+                queries = queries + ffn(queries)
+                queries = ffn_norm(queries)
+            queries = rearrange(queries, '(b h w) f c -> (b f) c h w', b=b, h=h, w=w)
+            tokens = rearrange(tokens, '(b h w) f c -> (b f) c h w', b=b, h=h, w=w)
+            
+            pose_queries = pose_up(pose_queries)
+            pose_tokens = pose_up(pose_tokens)
+            pose_queries = torch.cat([pose_queries, encoder_out_pose_queries], dim=2)
+            pose_tokens = torch.cat([pose_tokens, encoder_out_pose_tokens], dim=2)
+            
+            for pose_temporal_attn, pose_temporal_norm, spatial_attn, spatial_norm, ffn, ffn_norm in pose_attn_de:
+                pose_queries = pose_queries + pose_temporal_attn(pose_queries, pose_tokens, pose_tokens, need_weights=False, attn_mask=self.attn_mask)[0]
+                pose_queries = pose_temporal_norm(pose_queries)
+                #b, f, h, w, c = queries.shape
+                pose_queries = rearrange(pose_queries, 'b f c -> (b f) 1 c')
+                #queries = rearrange(queries, 'b f h w c -> (b f) (h w) c')
+                queries = rearrange(queries, '(b f) c h w -> (b f) (h w) c', b=b, f=f, h=h, w=w)
+                pose_queries = pose_queries + spatial_attn(pose_queries, queries, queries, need_weights=False, attn_mask=None)[0]
+                pose_queries = spatial_norm(pose_queries)
+                
+                pose_queries = pose_queries + ffn(pose_queries)
+                pose_queries = ffn_norm(pose_queries)
+                queries = rearrange(queries, '(b f) (h w) c -> (b f) c h w', b=b, f=f, h=h, w=w)
+                pose_queries = rearrange(pose_queries, '(b f) 1 c -> b f c', b=b, f=f)
+            pose_queries = pose_de_(pose_queries)
+            pose_tokens = pose_de_(pose_tokens)
+            queries = decoder(queries)
+            tokens = decoder(tokens)
+        
+        queries = self.conv_out(queries)
+        pose_queries = self.pose_out(pose_queries)
+        queries = rearrange(queries, '(b f) c h w -> b f c h w', b=b, f=f)
+        queries, image_queries = torch.split(queries, token_channel * 4, dim=2) # assume both occupancy and image channels x4
+
+        return queries, pose_queries, image_queries
+    
+    def occ_with_img_forward_debug(self, tokens, pose_tokens, img_tokens):
+        #import pdb;pdb.set_trace()
+        # tokens: bs, f, c, h, w
+        # pose_tokens, bs, f, c
+        # print(tokens.shape, pose_tokens.shape, img_tokens.shape)
+        bs, F, C, H, W = tokens.shape
+        assert F == self.num_frames
+        tokens = rearrange(tokens, 'b f c h w -> b f h w c')
+
+        if self.learnable_queries:
+            queries = self.queries.weight.reshape(1, 1, H, W, C).expand(bs, F, H, W, C)
+        else:
+            queries = tokens
+        queries = queries + self.temporal_embeddings.weight[None, self.offset:, None, None, :].expand(
+            bs, -1, H, W, -1)
+        tokens = tokens + self.temporal_embeddings.weight[None, :self.num_frames, None, None, :].expand(
+            bs, -1, H, W, -1)
+        
+        if self.learnable_queries:
+            pose_queries = self.pose_queries.weight.reshape(1, 1, C).expand(bs, F, C)
+        else:
+            pose_queries = pose_tokens
+        pose_queries = pose_queries + self.pose_temporal_embeddings.weight[None, self.offset:, :].expand(
+            bs, -1, -1)
+        pose_tokens = pose_tokens + self.pose_temporal_embeddings.weight[None, :self.num_frames, :].expand(
+            bs, -1, -1)
+
+        # get image tokens
+        img_tokens = rearrange(img_tokens, 'b f c h w -> b c f h w')
+        img_tokens = self.img_conv(img_tokens)  # c = base_channel
+        img_tokens = rearrange(img_tokens, 'b c f h w -> b f h w c')
+        _, _, H_img, W_img, _ = img_tokens.shape
+
+        img_queries = img_tokens
+        
+        img_queries = img_queries + self.img_temporal_embeddings.weight[None, self.offset:, None, None, :].expand(
+            bs, -1, H_img, W_img, -1)
+        img_tokens = img_tokens + self.img_temporal_embeddings.weight[None, :self.num_frames, None, None, :].expand(
+            bs, -1, H_img, W_img, -1)
+        
+        encoder_outs_tokens = []
+        encoder_outs_queries = []
+        img_encoder_outs_tokens = []
+        img_encoder_outs_queries = []
+        encoder_outs_pose_tokens = []
+        encoder_outs_pose_queries = []
+        
+        for temporal_attn, encoder, img_encoder, down, img_down, pose_attn_en, pose_en in zip(
+            self.temporal_attentions_en, self.encoders, self.img_encoders, self.downsamples, 
+            self.img_downsamples, self.pose_attn_en, self.pose_en):
+
+            b, f, h, w, c = tokens.shape
+            _, _, hi, wi, ci = img_tokens.shape
+            
+            for pose_temporal_attn, pose_temporal_norm, spatial_attn, spatial_norm, ffn, ffn_norm in pose_attn_en:
+                pose_queries = pose_queries + pose_temporal_attn(pose_queries, pose_tokens, pose_tokens, need_weights=False, attn_mask=self.attn_mask)[0]
+                pose_queries = pose_temporal_norm(pose_queries)
+                #b, f, h, w, c = queries.shape
+                pose_queries = rearrange(pose_queries, 'b f c -> (b f) 1 c')
+                _queries = torch.cat((
+                    rearrange(queries, 'b f h w c -> (b f) (h w) c'), 
+                    rearrange(img_queries, 'b f h w c -> (b f) (h w) c')), dim=1)
+
+                pose_queries = pose_queries + spatial_attn(pose_queries, _queries, _queries, need_weights=False, attn_mask=None)[0]
+                print('in pose', _queries.shape, pose_queries.shape)
+                pose_queries = spatial_norm(pose_queries)
+                
+                pose_queries = pose_queries + ffn(pose_queries)
+                pose_queries = ffn_norm(pose_queries)
+                pose_queries = rearrange(pose_queries, '(b f) 1 c -> b f c', b=b, f=f)
+                # queries = rearrange(queries, '(b f) (h w) c -> b f h w c', b=b, f=f, h=h, w=w)
+
+            pose_queries = pose_en(pose_queries)
+            pose_tokens = pose_en(pose_tokens)
+            encoder_outs_pose_queries.append(pose_queries)
+            encoder_outs_pose_tokens.append(pose_tokens)
+
+            queries = rearrange(queries, 'b f h w c -> (b h w) f c')
+            tokens = rearrange(tokens, 'b f h w c -> (b h w) f c')
+            pre_q = queries.shape[0]
+            pre_t = tokens.shape[0]
+
+            img_queries = rearrange(img_queries, 'b f h w c -> (b h w) f c')
+            img_tokens = rearrange(img_tokens, 'b f h w c -> (b h w) f c')
+
+            queries = torch.cat((queries, img_queries), dim=0)
+            tokens = torch.cat((tokens, img_tokens), dim=0)
+
+            for cross_attn, cross_norm, ffn, ffn_norm in temporal_attn:
+                queries = queries + cross_attn(queries, tokens, tokens, need_weights=False, attn_mask=self.attn_mask)[0]
+                queries = cross_norm(queries)
+                
+                queries = queries + ffn(queries)
+                queries = ffn_norm(queries)
+
+            queries, img_queries = torch.split(queries, pre_q, dim=0)
+            tokens, img_tokens = torch.split(tokens, pre_t, dim=0)
+
+            queries = rearrange(queries, '(b h w) f c -> (b f) c h w', b=b, h=h, w=w)
+            tokens = rearrange(tokens, '(b h w) f c -> (b f) c h w', b=b, h=h, w=w)
+
+            img_queries = rearrange(img_queries, '(b h w) f c -> (b f) c h w', b=b, h=hi, w=wi)
+            img_tokens = rearrange(img_tokens, '(b h w) f c -> (b f) c h w', b=b, h=hi, w=wi)
+            print('after cross attention', queries.shape, img_queries.shape)
+
+            queries = encoder(queries)
+            tokens = encoder(tokens)
+            encoder_outs_tokens.append(tokens)
+            encoder_outs_queries.append(queries)
+            queries = down(queries)
+            tokens = down(tokens)
+            queries = rearrange(queries, '(b f) c h w -> b f h w c', b=b, f=f)
+            tokens = rearrange(tokens, '(b f) c h w -> b f h w c', b=b, f=f) 
+
+            img_queries = img_encoder(img_queries)
+            img_tokens = img_encoder(img_tokens)
+            img_encoder_outs_tokens.append(img_tokens)
+            img_encoder_outs_queries.append(img_queries)
+            img_queries = img_down(img_queries)
+            img_tokens = img_down(img_tokens)
+            img_queries = rearrange(img_queries, '(b f) c h w -> b f h w c', b=b, f=f)
+            img_tokens = rearrange(img_tokens, '(b f) c h w -> b f h w c', b=b, f=f) 
+
+        # mid blocks    
+        b, f, h, w, c = queries.shape
+        queries = rearrange(queries, 'b f h w c -> (b f) c h w')
+        tokens = rearrange(tokens, 'b f h w c -> (b f) c h w')
+        queries = self.mid(queries)
+        tokens = self.mid(tokens)
+
+        _, _, hi, wi, ci = queries.shape
+        img_queries = rearrange(img_queries, 'b f h w c -> (b f) c h w')
+        img_tokens = rearrange(img_tokens, 'b f h w c -> (b f) c h w')
+        img_queries = self.img_mid(img_queries)
+        img_tokens = self.img_mid(img_tokens)
         
         pose_queries = self.pose_mid(pose_queries)
         pose_tokens = self.pose_mid(pose_tokens)
@@ -432,11 +808,15 @@ class PlanUAutoRegTransformer(BaseModule):
         
         return queries,  pose_queries
     
-    def forward_autoreg(self, tokens, pose_tokens, start_frame=0, mid_frame=6, end_frame=12):
+    def forward_autoreg(self, tokens, pose_tokens, img_tokens=None, start_frame=0, mid_frame=6, end_frame=12):
         tokens = tokens[:, start_frame:mid_frame]
         pose_tokens = pose_tokens[:, start_frame:mid_frame]
         for i in range(mid_frame, end_frame):
-            token, pose_token = self.forward_autoreg_step(tokens, pose_tokens, start_frame, i)
+            if self.img_vae_exist:
+                assert img_tokens is not None
+                token, pose_token, img_token = self.forward_autoreg_step(tokens, pose_tokens, img_tokens, start_frame, i)
+            else:
+                token, pose_token = self.forward_autoreg_step(tokens, pose_tokens, start_frame, i)
             
             tokens = torch.cat([tokens, token[:, -1:]], dim=1)
             pose_tokens = torch.cat([pose_tokens, pose_token[:, -1:]], dim=1)
@@ -451,6 +831,7 @@ class PlanUAutoRegTransformer(BaseModule):
     def forward_autoreg_step(self, tokens, pose_tokens, start_frame=0, mid_frame=6):
         bs, F, C, H, W = tokens.shape
         #assert F == self.num_frames
+        start_frame += max(mid_frame - self.num_frames, 0)
         tokens = tokens[:, start_frame:mid_frame]
         pose_tokens = pose_tokens[:, start_frame:mid_frame]
         bs, F, C, H, W = tokens.shape
@@ -588,7 +969,6 @@ class PlanUAutoRegTransformer(BaseModule):
         queries = self.conv_out(queries)
         pose_queries = self.pose_out(pose_queries)
         queries = rearrange(queries, '(b f) c h w -> b f c h w', b=b, f=f)
-        
         
         return queries,  pose_queries
 

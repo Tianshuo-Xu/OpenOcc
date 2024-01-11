@@ -2,7 +2,7 @@ eval_with_pose = True
 start_frame = 0
 
 mid_frame = 5
-end_frame = 11
+end_frame = 125  # one minute
 
 plan_return_last = True
 eval_length = end_frame-mid_frame
@@ -11,8 +11,8 @@ grad_max_norm = 35
 print_freq = 10
 max_epochs = 200
 warmup_iters = 50
-return_len_ = end_frame
-return_len_train = end_frame
+return_len_ = 11
+return_len_train = return_len_
 num_frames_ = 15
 load_from = 'out/occworld_debug/epoch_42.pth'
 port = 25095

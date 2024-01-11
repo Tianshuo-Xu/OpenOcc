@@ -4,11 +4,13 @@ max_epochs = 200
 warmup_iters = 50
 return_len_ = 15
 return_len_train = 15
-load_from = 'out/occworld_debug/epoch_200.pth'
-port = 25096
-# revise_ckpt = 3
+# load_from = 'out/occworld_debug/epoch_200.pth'
+load_from = '/hpc2hdd/home/txu647/code/OccWorld/out/vqvae/epoch_103.pth'
+port = 25097
+revise_ckpt = 3
+mini_batch = 2
 eval_every_epochs = 5
-save_every_epochs = 20
+save_every_epochs = 5
 multisteplr = False
 multisteplr_config = dict(
     decay_t = [87 * 500],
@@ -19,6 +21,7 @@ multisteplr_config = dict(
 
 freeze_dict = dict(
     vae = True,
+    img_vae = True,
     transformer = False,
     pose_encoder = False,
     pose_decoder = False,
@@ -62,15 +65,15 @@ val_wrapper_config = dict(
 )
 
 train_loader = dict(
-    batch_size = 2,
+    batch_size = 1,
     shuffle = True,
-    num_workers = 1,
+    num_workers = 8,
 )
     
 val_loader = dict(
     batch_size = 1,
     shuffle = False,
-    num_workers = 1,
+    num_workers = 4,
 )
 
 loss = dict(
@@ -82,6 +85,12 @@ loss = dict(
             input_dict={
                 'ce_inputs': 'ce_inputs',
                 'ce_labels': 'ce_labels'}),
+        dict(
+            type='MSELoss',
+            weight=6.0,
+            input_dict={
+                'mse_img_inputs': 'mse_img_inputs',
+                'mse_img_labels': 'mse_img_labels'}),
         dict(
             type='PlanRegLossLidar',
             weight=0.1,
@@ -96,11 +105,14 @@ loss = dict(
 loss_input_convertion = dict(
     ce_inputs = 'ce_inputs',
     ce_labels = 'ce_labels',
+    mse_img_inputs = 'mse_img_inputs',
+    mse_img_labels = 'mse_img_labels',
     rel_pose='pose_decoded',
     metas ='output_metas',
 )
 
 base_channel = 64
+image_channel = 24
 _dim_ = 16
 expansion = 8
 n_e_ = 512
@@ -155,31 +167,37 @@ model = dict(
         num_tokens=1,
         num_frames=return_len_,
         num_layers=2,
-        img_shape=(base_channel*2,50,50),
-        pose_shape=(1,base_channel*2),
+        occ_shape=(base_channel * 2 + image_channel, 50, 50),
+        pose_shape=(1, base_channel * 2 + image_channel),
         pose_attn_layers=2,
-        pose_output_channel=base_channel*2,
-        tpe_dim=base_channel*2,
-        channels=(base_channel*2, base_channel*4, base_channel*8),
+        pose_output_channel=base_channel * 2 + image_channel,
+        tpe_dim=base_channel * 2 + image_channel,
+        channels=(
+            base_channel * 2 + image_channel, 
+            base_channel * 4 + image_channel * 2, 
+            base_channel * 8 + image_channel * 4
+        ),
         temporal_attn_layers=6,
-        output_channel=n_e_,
-        learnable_queries=False
+        output_channel=n_e_ + image_channel,
+        learnable_queries=False,
+        img_vae_exist=img_exist,
     ),
     pose_encoder=dict(
         type = 'PoseEncoder',
         in_channels=5,
-        out_channels=base_channel*2,
+        out_channels=base_channel * 2 + image_channel,
         num_layers=2,
         num_modes=3,
         num_fut_ts=1,
     ),
     pose_decoder=dict(
         type = 'PoseDecoder',
-        in_channels=base_channel*2,
+        in_channels=base_channel * 2 + image_channel,
         num_layers=2,
         num_modes=3,
         num_fut_ts=1,
     ),
+    img_vae_exist=img_exist,
 )
 
 

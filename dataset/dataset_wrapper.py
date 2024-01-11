@@ -29,11 +29,11 @@ class tpvformer_dataset_nuscenes(data.Dataset):
         return imgs
 
     def __getitem__(self, index):
-        input, target, metas = self.point_cloud_dataset[index]
+        input, target, metas, input_imgs, output_imgs = self.point_cloud_dataset[index]
         #### adapt to vae input
         input = torch.from_numpy(input)
         target = torch.from_numpy(target)
-        return input, target, metas
+        return input, target, metas, torch.from_numpy(input_imgs), torch.from_numpy(output_imgs)
         
 
 def custom_collate_fn_temporal(data):

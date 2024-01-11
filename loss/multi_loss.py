@@ -18,7 +18,6 @@ class MultiLoss(nn.Module):
         self.iter_counter = 0
 
     def forward(self, inputs):
-        
         loss_dict = {}
         tot_loss = 0.
         for loss_func in self.losses:

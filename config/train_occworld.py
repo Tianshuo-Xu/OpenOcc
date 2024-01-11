@@ -91,6 +91,8 @@ loss = dict(
     ]
 )
 
+img_exist = False
+
 loss_input_convertion = dict(
     ce_inputs = 'ce_inputs',
     ce_labels = 'ce_labels',
@@ -153,7 +155,7 @@ model = dict(
         num_tokens=1,
         num_frames=return_len_,
         num_layers=2,
-        img_shape=(base_channel*2,50,50),
+        occ_shape=(base_channel*2,50,50),
         pose_shape=(1,base_channel*2),
         pose_attn_layers=2,
         pose_output_channel=base_channel*2,

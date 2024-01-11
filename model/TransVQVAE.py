@@ -2,7 +2,7 @@ from mmengine.registry import MODELS
 from mmengine.model import BaseModule
 import numpy as np
 import torch.nn as nn, torch
-import torch.nn.functional as F
+import torch.nn.functional as Func
 from einops import rearrange
 from copy import deepcopy
 import torch.distributions as dist
@@ -36,19 +36,19 @@ class TransVQVAE(BaseModule):
         # adding image modality
         if self.img_vae_exist:
             self.img_vae = AutoencoderKL.from_pretrained(
-                "/hpc2hdd/home/txu647/.cache/huggingface/hub/models--stabilityai--stable-diffu\
-                sion-2-base/snapshots/fa386bb446685d8ad8a8f06e732a66ad10be6f47", subfolder="vae", revision=None, variant=None
+                "/hpc2hdd/home/txu647/.cache/huggingface/hub/models--stabilityai--stable-diffusion-2-base/snapshots/fa386bb446685d8ad8a8f06e732a66ad10be6f47",
+                subfolder="vae", revision=None, variant=None
             )
             self.img_vae.requires_grad_(False)
 
-    def forward(self, x, metas=None):
+    def forward(self, x, metas=None, img=None):
         if hasattr(self, 'pose_encoder'):
             if self.training:
-                return self.forward_train_with_plan(x, metas)
+                return self.forward_train_with_plan(x, metas, img)
             else:
-                return self.forward_inference_with_plan(x, metas)
+                return self.forward_inference_with_plan(x, metas, img)
         if self.training:
-            return self.forward_train(x)
+            return self.forward_train(x, img)
         else:
             return self.forward_inference(x)
         
@@ -59,6 +59,7 @@ class TransVQVAE(BaseModule):
         assert hasattr(self.vae, 'vqvae')
         bs, F, H, W, D = x.shape
         assert F == self.num_frames + self.offset
+
         output_dict = {}
         # encode
         z, shape = self.vae.forward_encoder(x)
@@ -67,7 +68,6 @@ class TransVQVAE(BaseModule):
             assert img is not None, "img is None"
             img_z = self.img_vae.encode(img.to(z.dtype)).latent_dist.sample()
             img_z = img_z * self.img_vae.config.scaling_factor
-            print(img_z.shape)
 
         # quantize
         z_q, loss, (perplexity, min_encodings, min_encoding_indices) = self.vae.vqvae.forward_quantizer(z, is_voxel=False)
@@ -134,25 +134,30 @@ class TransVQVAE(BaseModule):
         # Apply the mask to the tensor
         masked_tensor = x * frame_mask.to(x.device)
 
-        return masked_tensor
-    
+        return masked_tensor        
+
     def forward_train_with_plan(self, x, metas, img=None):
         assert hasattr(self.vae, 'vqvae')
         assert hasattr(self, 'pose_encoder')
         bs, F, H, W, D = x.shape
         assert F == self.num_frames + self.offset
+
         output_dict = {}
         z, shape = self.vae.forward_encoder(x)
         z = self.vae.vqvae.quant_conv(z)
         if self.img_vae_exist:
-            assert img is not None, "img is None"
+            assert img is not None, "img is None"  # img: (bs, frames, views, c, h, w)
+            img = rearrange(img, 'b f v c h w -> (b f v) c h w')
             img_z = self.img_vae.encode(img.to(z.dtype)).latent_dist.sample()
             img_z = img_z * self.img_vae.config.scaling_factor
-            print(img_z.shape)
+            img_z = rearrange(img_z, '(b f v) c h w -> b f (v c) h w', b=bs, f=F)
+            output_dict['mse_img_labels'] = img_z[:, self.offset:].detach().flatten(0, 1)
+            # print(img_z.shape, output_dict['ce_img_labels'].shape)
 
         z_q, loss, (perplexity, min_encodings, min_encoding_indices) = self.vae.vqvae.forward_quantizer(z, is_voxel=False)
         min_encoding_indices = rearrange(min_encoding_indices, '(b f) h w -> b f h w', b=bs)
-        output_dict['ce_labels'] = min_encoding_indices[:, self.offset:].detach().flatten(0,1)
+        # print('indices:', min_encoding_indices.shape, 'z_q:', z_q.shape)
+        output_dict['ce_labels'] = min_encoding_indices[:, self.offset:].detach().flatten(0, 1)
         z_q = rearrange(z_q, '(b f) c h w -> b f c h w', b=bs)
         hidden = None
         if self.give_hiddens:
@@ -162,8 +167,13 @@ class TransVQVAE(BaseModule):
         
         # random mask
         # z_q = self.random_mask(z_q)
-
-        z_q_predict, rel_poses = self.transformer(z_q[:, :self.num_frames], pose_tokens=rel_poses)
+        if self.img_vae_exist:
+            z_q_predict, rel_poses, img_z_predict = self.transformer(
+                z_q[:, :self.num_frames], pose_tokens=rel_poses, img_tokens=img_z[:, :self.num_frames])
+            # print(z_q_predict.shape, img_z_predict.shape)
+            output_dict['mse_img_inputs'] = img_z_predict.flatten(0, 1)
+        else:
+            z_q_predict, rel_poses = self.transformer(z_q[:, :self.num_frames], pose_tokens=rel_poses)
         
         pose_decoded = self.pose_decoder(rel_poses)
         output_dict['pose_decoded'] = pose_decoded
@@ -176,12 +186,20 @@ class TransVQVAE(BaseModule):
         # z: bs*f, h, w
         return output_dict
     
-    def forward_inference_with_plan(self, x, metas):
+    def forward_inference_with_plan(self, x, metas, img=None):
         bs, F, H, W, D = x.shape
         output_dict = {}
         output_dict['target_occs'] = x[:, self.offset:]
         z, shape = self.vae.forward_encoder(x)
         z = self.vae.vqvae.quant_conv(z)
+        if self.img_vae_exist:
+            assert img is not None, "img is None"  # img: (bs, frames, views, c, h, w)
+            img = rearrange(img, 'b f v c h w -> (b f v) c h w')
+            img_z = self.img_vae.encode(img.to(z.dtype)).latent_dist.sample()
+            img_z = img_z * self.img_vae.config.scaling_factor
+            img_z = rearrange(img_z, '(b f v) c h w -> b f (v c) h w', b=bs, f=F)
+            output_dict['mse_img_labels'] = img_z[:, self.offset:].detach().flatten(0, 1)
+
         z_q, loss, (perplexity, min_encodings, min_encoding_indices) = self.vae.vqvae.forward_quantizer(z, is_voxel=False)
         min_encoding_indices = rearrange(min_encoding_indices, '(b f) h w -> b f h w', b=bs)
         output_dict['ce_labels'] = min_encoding_indices[:, self.offset:].detach().flatten(0,1)
@@ -192,7 +210,13 @@ class TransVQVAE(BaseModule):
             
         rel_poses, output_metas = self._get_pose_feature(metas, F-self.offset)
         
-        z_q_predict, rel_poses = self.transformer(z_q[:, :self.num_frames], pose_tokens=rel_poses)
+        if self.img_vae_exist:
+            z_q_predict, rel_poses, img_z_predict = self.transformer(
+                z_q[:, :self.num_frames], pose_tokens=rel_poses, img_tokens=img_z[:, :self.num_frames])
+            # print(z_q_predict.shape, img_z_predict.shape)
+            output_dict['mse_img_inputs'] = img_z_predict.flatten(0, 1)
+        else:
+            z_q_predict, rel_poses = self.transformer(z_q[:, :self.num_frames], pose_tokens=rel_poses)
         
         pose_decoded = self.pose_decoder(rel_poses)
         output_dict['pose_decoded'] = pose_decoded
@@ -271,6 +295,7 @@ class TransVQVAE(BaseModule):
             input_meta['gt_mode'] = meta['gt_mode'][start_frame:mid_frame]
             input_metas.append(input_meta)
         output_dict['input_metas'] = input_metas
+
         for meta in metas:
             output_meta = dict()
             output_meta['rel_poses'] = meta['rel_poses'][mid_frame:end_frame]#-meta['rel_poses'][mid_frame-1]
@@ -295,26 +320,32 @@ class TransVQVAE(BaseModule):
         t2 = time.time()
         poses_ = []
         for i in range(mid_frame, end_frame):
+            # print(z_q_predict.shape, rel_poses_state.shape, start_frame, i)
             z_q_, rel_poses_ = self.transformer.forward_autoreg_step(
                 z_q_predict, pose_tokens=rel_poses_state,
                 start_frame=start_frame, mid_frame=i)
             z_q_list.append(z_q_[:, -1:])
             #print(z_q_.shape)
             z_q_ = z_q_[:, -1:].clone().detach().argmax(dim=2)
-            #print(z_q_.shape)
+            # print('z_q', z_q_.shape)
             z_q_ = self.vae.vqvae.get_codebook_entry(z_q_, shape=None)
             z_q_ = rearrange(z_q_, 'b f h w c-> b f c h w')
             z_q_predict = torch.cat([z_q_predict, z_q_], dim=1)
             rel_poses = torch.cat([rel_poses, rel_poses_[:, -1:]], dim=1)
-            rel_poses_state_, rel_poses_sumed, pose_ = self.decode_pose(rel_poses_[:, -1:], gt_mode[:,i:i+1], rel_poses_sumed)
+
+            gt_mode_decode = gt_mode[:,i:i+1]
+            if gt_mode_decode.shape[1] == 0:
+                gt_mode_decode = gt_mode[:, -1:]
+            
+            rel_poses_state_, rel_poses_sumed, pose_ = self.decode_pose(rel_poses_[:, -1:], gt_mode_decode, rel_poses_sumed)
             poses_.append(pose_)
             rel_poses_state = torch.cat([rel_poses_state, rel_poses_state_], dim=1)
+
         poses_ = torch.cat(poses_, dim=1)
         output_dict['poses_'] = poses_
         t3 = time.time()
         z_q_predict = z_q_predict[:, mid_frame:end_frame]
         rel_poses = rel_poses[:, mid_frame:end_frame]
-        #assert False, f'z_q_predict.shape: {z_q_predict.shape}, rel_poses.shape: {rel_poses.shape}, {output_dict["target_occs"].shape}'
         # print(z_q_predict.shape, rel_poses.shape)
         pose_decoded = self.pose_decoder(rel_poses)
         output_dict['pose_decoded'] = pose_decoded
@@ -366,9 +397,10 @@ class TransVQVAE(BaseModule):
         pose = torch.cat([pose, gt_mode], dim=-1)
         pose = self.pose_encoder(pose.float())
         return pose, rel_poses_sumed, pose_decoded
+
     def forward_autoreg(self, x, metas=None, start_frame=0, mid_frame=6,end_frame=12):
-        
         pass
+        
     def generate_inference(self, x):
         #import pdb; pdb.set_trace()
         bs, F, H, W, D = x.shape

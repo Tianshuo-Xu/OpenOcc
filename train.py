@@ -155,6 +155,7 @@ def main(local_rank, args):
         if hasattr(train_dataset_loader.sampler, 'set_last_iter'):
             train_dataset_loader.sampler.set_last_iter(last_iter)
         print(f'successfully resumed from epoch {epoch}')
+        
     elif cfg.load_from:
         ckpt = torch.load(cfg.load_from, map_location='cpu')
         if 'state_dict' in ckpt:
@@ -187,6 +188,10 @@ def main(local_rank, args):
     # logger.info('compiling model')
     # my_model = torch.compile(my_model)
     # logger.info('done compile model')
+
+    # mini_batch = cfg.get('mini_batch', 1)
+    # print('mini_batch:', mini_batch)
+
     best_plan_loss = 100000
     while epoch < max_num_epochs:
         my_model.train()
@@ -194,10 +199,13 @@ def main(local_rank, args):
         if hasattr(train_dataset_loader.sampler, 'set_epoch'):
             train_dataset_loader.sampler.set_epoch(epoch)
         loss_list = []
-        time.sleep(10)
+        # time.sleep(10)
         data_time_s = time.time()
         time_s = time.time()
-        for i_iter, (input_occs, target_occs, metas) in enumerate(train_dataset_loader):
+        # for i_iter, (input_occs, target_occs, metas) in enumerate(train_dataset_loader):
+        optimizer.zero_grad()
+        # data_time_e = 0
+        for i_iter, (input_occs, target_occs, metas, input_imgs, output_imgs) in enumerate(train_dataset_loader):
             if first_run:
                 i_iter = i_iter + last_iter
             
@@ -205,7 +213,13 @@ def main(local_rank, args):
             target_occs = target_occs.cuda()
             data_time_e = time.time()
 
-            result_dict = my_model(x=input_occs, metas=metas)
+            # print(input_imgs.shape)  # (bs, frame, view, c, h, w)
+            
+            result_dict = my_model(
+                x=input_occs, 
+                metas=metas, 
+                img=input_imgs.cuda() if cfg.img_exist else None,
+            )
 
             loss_input = {
                 'inputs': input_occs,
@@ -221,13 +235,16 @@ def main(local_rank, args):
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(my_model.parameters(), cfg.grad_max_norm)
             optimizer.step()
+            # if i_iter % mini_batch == 0:
+            #     optimizer.step()
+            #     optimizer.zero_grad()
 
             loss_list.append(loss.detach().cpu().item())
             scheduler.step_update(global_iter)
-            time_e = time.time()
 
             global_iter += 1
             if i_iter % print_freq == 0 and local_rank == 0:
+                time_e = time.time()
                 lr = optimizer.param_groups[0]['lr']
                 logger.info('[TRAIN] Epoch %d Iter %5d/%d: Loss: %.3f (%.3f), grad_norm: %.3f, lr: %.7f, time: %.3f (%.3f)'%(
                     epoch, i_iter, len(train_dataset_loader), 
@@ -257,6 +274,8 @@ def main(local_rank, args):
                     dst_file = osp.join(args.work_dir, 'latest.pth')
                     symlink(save_file_name, dst_file)
                     logger.info(f'iter ckpt {i_iter + 1} saved!')
+
+            # break
         
         # save checkpoint
         if local_rank == 0 and epoch % cfg.get('save_every_epochs', 1) == 0:
@@ -286,13 +305,17 @@ def main(local_rank, args):
         plan_loss = 0
         
         with torch.no_grad():
-            for i_iter_val, (input_occs, target_occs, metas) in enumerate(val_dataset_loader):
+            for i_iter_val, (input_occs, target_occs, metas, input_imgs, output_imgs) in enumerate(val_dataset_loader):
                 
                 input_occs = input_occs.cuda()
                 target_occs = target_occs.cuda()
                 data_time_e = time.time()
                 
-                result_dict = my_model(x=input_occs, metas=metas)
+                result_dict = my_model(
+                    x=input_occs, 
+                    metas=metas, 
+                    img=input_imgs.cuda() if cfg.img_exist else None,
+                )
 
                 loss_input = {
                     'inputs': input_occs,
@@ -316,8 +339,8 @@ def main(local_rank, args):
                 CalMeanIou_vox._after_step(result_dict['iou_pred'], target_occs_iou)
                 val_loss_list.append(loss.detach().cpu().numpy())
                 if i_iter_val % print_freq == 0 and local_rank == 0:
-                    logger.info('[EVAL] Epoch %d Iter %5d: Loss: %.3f (%.3f)'%(
-                        epoch, i_iter_val, loss.item(), np.mean(val_loss_list)))
+                    logger.info('[EVAL] Epoch %d Iter %5d/%d: Loss: %.3f (%.3f)'%(
+                        epoch, i_iter_val, len(val_dataset_loader), loss.item(), np.mean(val_loss_list)))
                     detailed_loss = []
                     for loss_name, loss_value in loss_dict.items():
                         detailed_loss.append(f'{loss_name}: {loss_value:.5f}')
@@ -338,7 +361,6 @@ def main(local_rank, args):
         logger.info(f'Current val iou is {val_iou} while the best val iou is {best_val_iou}')
         logger.info(f'Current val miou is {val_miou} while the best val miou is {best_val_miou}')
         torch.cuda.empty_cache()
-
 
 if __name__ == '__main__':
     # Training settings

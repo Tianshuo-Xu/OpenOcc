@@ -5,7 +5,6 @@ import torch
 
 @OPENOCC_LOSS.register_module()
 class CeLoss(BaseLoss):
-    
     def __init__(self, weight=1.0, ignore_label=-100,
             use_weight=False, cls_weight=None, input_dict=None, **kwargs):
         super().__init__(weight)
@@ -27,3 +26,26 @@ class CeLoss(BaseLoss):
         # output: -1, 1
         ce_loss = F.cross_entropy(ce_inputs, ce_labels)
         return ce_loss
+    
+
+@OPENOCC_LOSS.register_module()
+class MSELoss(BaseLoss):
+    def __init__(self, weight=1.0, ignore_label=-100,
+            use_weight=False, cls_weight=None, input_dict=None, lamda=1, **kwargs):
+        super().__init__(weight)
+        
+        if input_dict is None:
+            self.input_dict = {
+                'mse_img_inputs': 'mse_img_inputs',
+                'mse_img_labels': 'mse_img_labels'
+            }
+        else:
+            self.input_dict = input_dict
+        self.loss_func = self.loss
+        self.ignore = ignore_label
+        self.use_weight = use_weight
+        self.cls_weight = torch.tensor(cls_weight) if cls_weight is not None else None
+        self.lamda = lamda
+    
+    def loss(self, mse_img_inputs, mse_img_labels):
+        return F.mse_loss(mse_img_inputs, mse_img_labels)

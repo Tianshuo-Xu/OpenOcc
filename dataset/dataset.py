@@ -38,6 +38,10 @@ class nuScenesSceneDatasetLidar:
         assert output_dataset == 'gts', f'only used for evaluation, output_dataset should be gts, but got {output_dataset}'
         self.input_dataset = input_dataset
         self.output_dataset = output_dataset
+
+        # self.img_size = (512, 288)   # gaia-1
+        self.img_size = (400, 400)
+        self.root_path = '/hpc2hdd/home/txu647'
         
     def __len__(self):
         'Denotes the total number of samples'
@@ -49,30 +53,39 @@ class nuScenesSceneDatasetLidar:
         scene_len = self.scene_lens[index]
         idx = np.random.randint(0, scene_len - self.return_len - self.offset + 1)
         occs = []
+        imgs = []
         for i in range(self.return_len + self.offset):
             token = self.nusc_infos[scene_name][idx + i]['token']
             label_file = os.path.join(self.data_path, f'{self.input_dataset}/{scene_name}/{token}/labels.npz')
             label = np.load(label_file)
             occ = label['semantics']
             occs.append(occ)
+            imgs.append(self.get_image_info(scene_name, idx + i)['imgs'])
+        input_imgs = np.stack(imgs)
         input_occs = np.stack(occs, dtype=np.int64)
+
         occs = []
+        imgs = []
         for i in range(self.return_len + self.offset):
             token = self.nusc_infos[scene_name][idx + i]['token']
             label_file = os.path.join(self.data_path, f'{self.output_dataset}/{scene_name}/{token}/labels.npz')
             label = np.load(label_file)
             occ = label['semantics']
             occs.append(occ)
+            imgs.append(self.get_image_info(scene_name, idx + i)['imgs'])
         output_occs = np.stack(occs, dtype=np.int64)
+        output_imgs = np.stack(imgs)
         metas = {}
         metas.update(scene_token=self.nusc_infos[scene_name][4]['token'])
         metas.update(self.get_meta_data(scene_name, idx))
-        metas.update(self.get_image_info(scene_name,idx))
+        # metas.update(self.get_image_info(scene_name,idx))
         metas.update(self.get_meta_data(scene_name, idx))
         if self.test_mode:
             metas.update(self.get_meta_info(scene_name, idx))
-        return input_occs[:self.return_len], output_occs[self.offset:], metas  # output=input when offset=0
 
+        # output=input when offset=0
+        return input_occs[:self.return_len], output_occs[self.offset:], metas, input_imgs[:self.return_len], output_imgs[self.offset:]  
+    
     def get_meta_data(self, scene_name, idx):
         gt_modes = []
         xys = []
@@ -85,7 +98,7 @@ class nuScenesSceneDatasetLidar:
     
     def get_image_info(self, scene_name, idx):
         T = 6
-        idx = idx + self.return_len + self.offset - 1 - T
+        # idx = idx + self.return_len + self.offset - 1 - T
         info = self.nusc_infos[scene_name][idx]
         # import pdb; pdb.set_trace()
         input_dict = dict(
@@ -107,12 +120,16 @@ class nuScenesSceneDatasetLidar:
         lidar2ego[:3, 3] = np.array(info['lidar2ego_translation']).T
         ego2lidar = np.linalg.inv(lidar2ego)
         for cam_type, cam_info in info['cams'].items():
-            path = cam_info['data_path']
-            image = Image.open(path).convert('RGB')
-            # image = image.resize(size, Image.ANTIALIAS)
+            path = self.root_path + cam_info['data_path'][1:].replace(".jpg", ".png")
+            try:
+                image = Image.open(path).convert('RGB')
+            except:
+                path = self.root_path + cam_info['data_path'][1:]
+                image = Image.open(path).convert('RGB')
+            image = image.resize(self.img_size, Image.Resampling.BICUBIC)
             image = np.array(image).transpose((2, 0, 1))
             image = image.astype(np.float32) / 127.5 - 1
-            print(image.shape)
+            # print(image.shape)
             imgs.append(image)
 
             # obtain lidar to image transformation matrix
@@ -143,7 +160,8 @@ class nuScenesSceneDatasetLidar:
             cam_positions.append(cam_position.flatten()[:3])
             #focal_position = np.linalg.inv(lidar2cam_rt.T) @ np.array([0., 0., f, 1.]).reshape([4, 1])
             focal_positions.append(focal_position.flatten()[:3])
-        
+
+        imgs = np.stack(imgs, axis=0)
         input_dict.update(
             dict(
                 imgs=imgs,

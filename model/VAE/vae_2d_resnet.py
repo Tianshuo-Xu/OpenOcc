@@ -220,7 +220,7 @@ class VAERes2D(BaseModule):
         similarity = torch.matmul(logits, template) # -1, D, cls
         # pred = similarity.argmax(dim=-1) # -1, D
         # pred = pred.reshape(bs, F, H, W, D)
-        return similarity.reshape(bs, F, H, W, D, self.num_cls)
+        return similarity.reshape(bs, -1, H, W, D, self.num_cls)
 
     def forward(self, x, **kwargs):
         # xs = self.forward_encoder(x)

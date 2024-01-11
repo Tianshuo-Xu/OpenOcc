@@ -94,12 +94,11 @@ loss_input_convertion = dict(
 )
 
 
-# load_from = '/hpc2hdd/home/txu647/code/OccWorld_before/out/vae3d_debug/epoch_47.pth'
-load_from = False
+load_from = '/hpc2hdd/home/txu647/code/OccWorld/out/vqvae/epoch_103.pth'
 
 _dim_ = 16
 expansion = 8
-base_channel = 8
+base_channel = 64
 n_e_ = 512
 model = dict(
     type = 'VAERes2D',
