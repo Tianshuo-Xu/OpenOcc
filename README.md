@@ -34,6 +34,9 @@ Given past 3D occupancy observations, our self-supervised OccWorld trained can f
 3. Anything about the installation of mmdetection3d, please refer to [mmdetection3d](https://mmdetection3d.readthedocs.io/en/latest/getting_started.html#installation)
 
 ## Preparing
+
+（如果只跑OccWorld，只准备2、3步就可以了，如果要跑image occ joint则需要下nuScenes的数据）
+
 1. Create soft link from data/nuscenes to your_nuscenes_path
 
 2. Prepare the gts semantic occupancy introduced in [Occ3d](https://github.com/Tsinghua-MARS-Lab/Occ3D)
@@ -62,7 +65,7 @@ OccWorld/data
 ## Getting Started
 
 ### Training
-Train the VQVAE on RTX 4090 with 24G GPU memory.
+Train the VQVAE on RTX 4090 with 24G GPU memory. （训练Occ的vqvae）
 ```
 python train.py --py-config config/train_vqvae.py --work-dir out/vqvae
 ```
@@ -70,7 +73,15 @@ Train the OccWorld on RTX 4090 with 24G GPU memory. (Remember to change the chec
 ```
 python train.py --py-config config/train_occworld.py --work-dir out/occworld
 ```
+训练image with occupancy：
+```
+python train.py --py-config config/train_occ_image_world.py --work-dir out/occworld_with_img
+```
+
 ### Evaluation
+
+（image occ generation的code还在写）
+
 Eval the model on RTX 4090 with 24G GPU memory. (Remember to change the checkpoint path of OccWorld in the config file)
 ```
 python eval_metric_stp3.py --py-config config/occworld.py --work-dir out/occworld
